@@ -1,0 +1,42 @@
+# 敏感配置
+config.json
+*.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+._*
+
+# Caches / logs
+*.log
+.pytest_cache/
+.mypy_cache/
+
+# 私有抓包/参考资料（不入库）
+*.har
+common.*.js
+vendors.*.js
+document.yaml

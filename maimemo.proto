@@ -1,75 +1,102 @@
-// 墨墨背单词 WebSocket 协议定义
-// 基于 common.29c89a32.js 分析得出
+// 墨墨背单词网页端私有 WebSocket 协议
+// 通过分析 tc-apis.maimemo.com 网页端 JS 还原。
+//
+// 仅作研究/参考用途。本仓库的 Python 实现没有依赖 protoc，
+// 直接按下面定义手写 varint / length-delimited 编解码（见 momo_ws.py）。
 
 syntax = "proto3";
 
 package maimemo;
 
-// 单词详情
-message WordItem {
-  string id = 1;              // 单词ID
-  string spelling = 2;        // 拼写
-  string phonetic_us = 3;     // 美式音标
-  string phonetic_uk = 4;     // 英式音标
-  repeated Pronunciation pronunciations = 5;  // 发音列表
-  repeated Phrase phrases = 6; // 例句列表
-  int32 difficulty = 7;       // 难度
-  bool is_first_show = 8;     // 是否首次显示
-  bool is_added = 9;          // 是否已添加
-  bool has_prev_word = 10;    // 是否有上一个单词
-  bool has_next_word = 11;    // 是否有下一个单词
-  string interpretation = 12; // 释义
+// ============================================================================
+// 信封（所有帧的统一外壳）
+// ============================================================================
+
+message WebsocketProtocolMessage {
+  string id        = 1;  // 请求/帧的唯一 ID
+  string reply_id  = 2;  // 若为响应帧，对应请求的 id
+  int32  event     = 3;  // 见 WebsocketProtocolEvent
+  bytes  data      = 4;  // 业务消息体（嵌套 protobuf）
+  bool   success   = 5;
+  repeated WebsocketProtocolError errors = 6;
 }
 
-message Pronunciation {
-  string url = 1;     // 发音URL
-  string accent = 2;   // 口音 (US/UK)
+message WebsocketProtocolError {
+  // 实际字段顺序/类型未完全确定，至少包含 code/kind 与 message
+  string code    = 1;
+  string message = 2;
+  string detail  = 3;
 }
 
-message Phrase {
-  string phrase = 1;        // 例句英文
-  string interpretation = 2; // 例句中文
-  repeated int32 highlight = 3; // 高亮位置
+enum WebsocketProtocolEvent {
+  UNKNOWN                  = 0;
+  SYSTEM_READY             = 1;
+  SYSTEM_PING              = 2;
+  SYSTEM_SUBSCRIBE_TOPICS  = 3;
+  WEBSTUDY_INIT_STUDY      = 1001;
+  WEBSTUDY_GET_WORD        = 1002;
+  WEBSTUDY_SUBMIT_RESPONSE = 1003;
 }
 
-// GET_WORD 请求和响应
+// ============================================================================
+// 业务请求
+// ============================================================================
+
+message WsWebStudyInitStudyRequest {}
+
 message WsWebStudyGetWordRequest {
-  bool back = 1;  // 是否返回上一个
+  bool back = 1;  // true = 回退到上一个单词
+}
+
+message WsWebStudySubmitResponseRequest {
+  string voc_id           = 1;  // 单词 ID（WebStudyWord.id，UUID 形式）
+  StudyResponse response  = 2;
+  StudyMethod  study_method = 3;
+  int32 recall_duration   = 4;  // 毫秒
+  int32 study_duration    = 5;  // 毫秒；服务端会校验不得超过实际耗时
+}
+
+enum StudyResponse {
+  RESPONSE_UNKNOWN       = 0;
+  FAMILIAR               = 1;
+  VAGUE                  = 2;
+  FORGET                 = 3;
+  WELL_FAMILIAR          = 4;
+  CANCEL_WELL_FAMILIAR   = 5;
+}
+
+enum StudyMethod {
+  STUDY_EN_CN = 0;
+  STUDY_CN_EN = 1;
+}
+
+// ============================================================================
+// 业务响应
+// ============================================================================
+
+message WebStudyWord {
+  string id          = 1;  // UUID
+  int32  voc_id      = 2;  // 数字 ID，与 REST 端 voc-xxx 不互通
+  string spelling    = 3;
+  string phonetic_us = 4;
+  string phonetic_uk = 5;
+  string hyphenation = 6;
+  int32  difficulty  = 7;
+}
+
+message WebStudyInterpretation {
+  string id             = 1;
+  int32  voc_id         = 2;
+  string interpretation = 3;
 }
 
 message WsWebStudyGetWordResponse {
-  WordItem word = 1;
-  int64 study_time_ms = 2;  // 学习时间(毫秒)
-  int32 server_time = 3;    // 服务器时间
-}
-
-// SUBMIT_RESPONSE 请求和响应
-message WsWebStudySubmitResponseRequest {
-  string voc_id = 1;           // 单词ID
-  string response = 2;         // FAMILIAR/VAGUE/FORGET
-  int32 recall_duration = 3;    // 回忆时长(毫秒)
-  int32 study_duration = 4;     // 学习时长(毫秒)
-  string study_method = 5;      // STUDY_CN_EN / STUDY_EN_CN
+  WebStudyWord word                     = 1;
+  repeated WebStudyInterpretation interpretations = 2;
+  // 字段 3/4 为 phrases/notes，结构略
+  int64 study_time_ms = 23;
 }
 
 message WsWebStudySubmitResponseResponse {
-  WordItem next = 1;  // 下一个单词
-}
-
-// QUERY_WORD 请求和响应 (根据代码推断)
-message WsWebStudyQueryWordRequest {
-  string voc_id = 1;  // 单词ID
-}
-
-message WsWebStudyQueryWordResponse {
-  WordItem word = 1;
-}
-
-// 通用信封格式
-message WsMessage {
-  string event = 1;
-  bytes data = 2;
-  string reply_id = 3;
-  bool success = 4;
-  repeated string errors = 5;
+  WsWebStudyGetWordResponse next = 1;  // 下一个单词随提交响应一起下发
 }

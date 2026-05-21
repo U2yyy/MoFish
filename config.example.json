@@ -1,0 +1,4 @@
+{
+    "ws_token": "从浏览器抓包 tc-apis.maimemo.com 拿到的 token",
+    "rest_token": "从 open.maimemo.com 开放平台申请的 token"
+}

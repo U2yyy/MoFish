@@ -27,7 +27,7 @@ from rich.panel import Panel
 
 # WebSocket 客户端 + 伪装控制台
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from momo_ws import MaimemoWSClient, StealthConsole
+from momo_ws import MaimemoWSClient
 
 try:
     from readchar import readchar as _readchar
@@ -349,7 +349,6 @@ async def learning_loop(client: MaimemoWSClient, console: Console,
 
             if ok:
                 learned.append({"spelling": word["spelling"], "id": word["id"], "status": status})
-                {"FAMILIAR": "known", "VAGUE": "fuzzy", "FORGET": "forgotten"}[status]
                 if status == "FAMILIAR":
                     stats["known"] += 1
                 elif status == "VAGUE":
