@@ -6,7 +6,7 @@ MoFish 主入口
 
 REST 拿进度 + WebSocket 真背词 + 伪装日志输出 + 单键交互 + Boss 键。
 
-作者: MoFish CLI Team
+作者: U2y
 Python: 3.8+
 """
 
