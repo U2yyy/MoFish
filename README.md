@@ -147,11 +147,11 @@ cp config.example.json config.json     # macOS / Linux
 
 需要在App侧获取公开的API_KEY
 
-`![image](https://github.com/user-attachments/assets/3a72f408-5112-4d7a-8eda-06bb89eec3b8)`
+![image](https://github.com/user-attachments/assets/3a72f408-5112-4d7a-8eda-06bb89eec3b8)
 
-`![image](https://github.com/user-attachments/assets/5856fa7f-b6c8-4192-a007-86b080826c4d)`
+![image](https://github.com/user-attachments/assets/5856fa7f-b6c8-4192-a007-86b080826c4d)
 
-`![image](https://github.com/user-attachments/assets/df56f633-1cd4-4286-b635-4a56acdfae93)`
+![image](https://github.com/user-attachments/assets/df56f633-1cd4-4286-b635-4a56acdfae93)
 
 #### 获取 `ws_token`
 
