@@ -1,0 +1,75 @@
+// 墨墨背单词 WebSocket 协议定义
+// 基于 common.29c89a32.js 分析得出
+
+syntax = "proto3";
+
+package maimemo;
+
+// 单词详情
+message WordItem {
+  string id = 1;              // 单词ID
+  string spelling = 2;        // 拼写
+  string phonetic_us = 3;     // 美式音标
+  string phonetic_uk = 4;     // 英式音标
+  repeated Pronunciation pronunciations = 5;  // 发音列表
+  repeated Phrase phrases = 6; // 例句列表
+  int32 difficulty = 7;       // 难度
+  bool is_first_show = 8;     // 是否首次显示
+  bool is_added = 9;          // 是否已添加
+  bool has_prev_word = 10;    // 是否有上一个单词
+  bool has_next_word = 11;    // 是否有下一个单词
+  string interpretation = 12; // 释义
+}
+
+message Pronunciation {
+  string url = 1;     // 发音URL
+  string accent = 2;   // 口音 (US/UK)
+}
+
+message Phrase {
+  string phrase = 1;        // 例句英文
+  string interpretation = 2; // 例句中文
+  repeated int32 highlight = 3; // 高亮位置
+}
+
+// GET_WORD 请求和响应
+message WsWebStudyGetWordRequest {
+  bool back = 1;  // 是否返回上一个
+}
+
+message WsWebStudyGetWordResponse {
+  WordItem word = 1;
+  int64 study_time_ms = 2;  // 学习时间(毫秒)
+  int32 server_time = 3;    // 服务器时间
+}
+
+// SUBMIT_RESPONSE 请求和响应
+message WsWebStudySubmitResponseRequest {
+  string voc_id = 1;           // 单词ID
+  string response = 2;         // FAMILIAR/VAGUE/FORGET
+  int32 recall_duration = 3;    // 回忆时长(毫秒)
+  int32 study_duration = 4;     // 学习时长(毫秒)
+  string study_method = 5;      // STUDY_CN_EN / STUDY_EN_CN
+}
+
+message WsWebStudySubmitResponseResponse {
+  WordItem next = 1;  // 下一个单词
+}
+
+// QUERY_WORD 请求和响应 (根据代码推断)
+message WsWebStudyQueryWordRequest {
+  string voc_id = 1;  // 单词ID
+}
+
+message WsWebStudyQueryWordResponse {
+  WordItem word = 1;
+}
+
+// 通用信封格式
+message WsMessage {
+  string event = 1;
+  bytes data = 2;
+  string reply_id = 3;
+  bool success = 4;
+  repeated string errors = 5;
+}
