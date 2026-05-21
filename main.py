@@ -4,7 +4,7 @@
 墨墨背单词 - 主入口
 ===================
 
-协调 REST API 获取单词列表，WebSocket 进行学习
+协调 REST API 获取学习进度，WebSocket 进行学习
 
 作者: MoFish CLI Team
 Python: 3.8+
@@ -15,7 +15,6 @@ import sys
 import json
 import time
 import asyncio
-import ssl
 import requests
 from datetime import datetime
 from typing import Optional, List, Dict, Any
@@ -23,23 +22,20 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+# 导入 WebSocket 客户端
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from momo_ws import MaimemoWSClient
+
 # ============================================================================
 # 配置
 # ============================================================================
 
 CONFIG_FILE = "config.json"
 API_BASE_URL = "https://open.maimemo.com/open"
-WS_URL = "wss://tc-apis.maimemo.com/study/ws/webstudy"
 
 # ============================================================================
 # 依赖检查
 # ============================================================================
-
-try:
-    import websockets
-except ImportError:
-    print("[错误] 缺少 websockets 库，请运行: pip install websockets")
-    sys.exit(1)
 
 try:
     from rich.console import Console
@@ -48,11 +44,11 @@ except ImportError:
     sys.exit(1)
 
 # ============================================================================
-# REST API 客户端
+# REST API 客户端 (仅用于获取进度)
 # ============================================================================
 
 class MaimemoRESTClient:
-    """REST API 客户端，用于获取单词列表"""
+    """REST API 客户端，仅用于获取学习进度"""
 
     def __init__(self, api_token: str):
         self.api_token = api_token.strip()
@@ -64,23 +60,6 @@ class MaimemoRESTClient:
             "Accept": "application/json",
         })
         self.timeout = (10, 30)
-
-    def get_today_items(self, limit: int = 100, is_finished: bool = None) -> List[Dict[str, Any]]:
-        """获取今日学习单词"""
-        try:
-            payload = {"limit": limit}
-            if is_finished is not None:
-                payload["is_finished"] = is_finished
-            resp = self.session.post(
-                f"{self.base_url}/api/v1/study/get_today_items",
-                json=payload,
-                timeout=self.timeout
-            )
-            if resp.ok:
-                return resp.json().get("data", {}).get("today_items", [])
-        except Exception as e:
-            print(f"[错误] 获取今日任务失败: {e}")
-        return []
 
     def get_study_progress(self) -> Dict[str, Any]:
         """获取今日学习进度"""
@@ -96,108 +75,8 @@ class MaimemoRESTClient:
             print(f"[错误] 获取学习进度失败: {e}")
         return {}
 
-    def query_vocabulary(self, spellings: List[str]) -> Dict[str, Dict]:
-        """批量查询单词详情"""
-        try:
-            resp = self.session.post(
-                f"{self.base_url}/api/v1/vocabulary/query",
-                json={"spellings": spellings},
-                timeout=self.timeout
-            )
-            if resp.ok:
-                result = {}
-                for item in resp.json().get("voc", []):
-                    result[item.get("spelling", "")] = item
-                return result
-        except Exception as e:
-            print(f"[警告] 查询单词详情失败: {e}")
-        return {}
-
     def close(self):
         self.session.close()
-
-
-# ============================================================================
-# WebSocket 学习客户端
-# ============================================================================
-
-class MaimemoWSLearner:
-    """WebSocket 学习客户端"""
-
-    def __init__(self, api_token: str):
-        self.api_token = api_token.strip()
-        self.ssl_ctx = ssl.create_default_context()
-        self.ssl_ctx.check_hostname = False
-        self.ssl_ctx.verify_mode = ssl.CERT_NONE
-
-    async def connect(self) -> Optional[Any]:
-        url = f"{WS_URL}?token={self.api_token}"
-        try:
-            return await websockets.connect(url, ssl=self.ssl_ctx)
-        except Exception as e:
-            print(f"[错误] WebSocket 连接失败: {e}")
-            return None
-
-    async def get_word_uuid(self) -> Optional[str]:
-        """获取单词 UUID"""
-        ws = await self.connect()
-        if not ws:
-            return None
-
-        try:
-            await ws.send('WEBSTUDY_INIT_STUDY {}')
-            await ws.recv()  # 忽略初始化响应
-
-            await ws.send('WEBSTUDY_GET_WORD')
-            resp = await asyncio.wait_for(ws.recv(), timeout=10)
-
-            if isinstance(resp, bytes) and len(resp) > 38:
-                uuid = resp[2:38].decode('utf-8')
-                await ws.close()
-                return uuid
-
-            await ws.close()
-        except Exception as e:
-            print(f"[错误] 获取单词失败: {e}")
-            await ws.close()
-
-        return None
-
-    async def submit_response(
-        self,
-        word_id: str,
-        response: str = "FAMILIAR",
-        recall_duration: int = 1000,
-        study_duration: int = 2000
-    ) -> bool:
-        """提交学习反馈"""
-        ws = await self.connect()
-        if not ws:
-            return False
-
-        try:
-            # 初始化
-            await ws.send('WEBSTUDY_INIT_STUDY {}')
-            await ws.recv()
-
-            # 提交反馈
-            data = {
-                "voc_id": word_id,
-                "response": response,
-                "recall_duration": recall_duration,
-                "study_duration": study_duration,
-                "study_method": "STUDY_CN_EN"
-            }
-            await ws.send(f'WEBSTUDY_SUBMIT_RESPONSE {json.dumps(data)}')
-            await asyncio.wait_for(ws.recv(), timeout=10)
-
-            await ws.close()
-            return True
-
-        except Exception as e:
-            print(f"[错误] 提交反馈失败: {e}")
-            await ws.close()
-            return False
 
 
 # ============================================================================
@@ -286,66 +165,49 @@ def main():
     stats = {"known": 0, "fuzzy": 0, "forgotten": 0}
     current = 0
 
-    learner = MaimemoWSLearner(ws_token)
+    # 创建 WebSocket 客户端
+    client = MaimemoWSClient(ws_token)
 
-    # 学习循环 - 直接使用 WS 获取单词
+    # 学习循环 - 使用正确的 Protobuf WebSocket 协议
     async def learning_loop():
         nonlocal current
-        import random
 
-        while True:
-            current += 1
+        # 连接 WebSocket
+        if not await client.connect():
+            console.print(Text(f"\n[错误] WebSocket 连接失败，退出", style="bold red"))
+            return stats, learned
 
-            # 显示进度 (基于已学计数)
-            filled = int(20 * (current - 1) / total) if total > 0 else 0
-            bar = '=' * filled + '-' * (20 - filled)
-            console.print(Text(f"\r[{bar}] {finished + current - 1}/{total}    ", style="cyan"), end="")
+        try:
+            # 初始化
+            if not await client.initialize():
+                console.print(Text(f"\n[错误] 初始化失败", style="bold red"))
+                return stats, learned
 
-            # 在同一次 WS 连接中获取 UUID 并提交
-            ws = await learner.connect()
-            if not ws:
-                console.print(Text(f"\n[错误] 连接失败，退出", style="bold red"))
-                break
+            while True:
+                current += 1
 
-            try:
-                # 初始化
-                await ws.send('WEBSTUDY_INIT_STUDY {}')
-                init_resp = await asyncio.wait_for(ws.recv(), timeout=10)
-                if not isinstance(init_resp, bytes):
-                    console.print(Text(f"\n[错误] 初始化失败", style="bold red"))
-                    break
+                # 显示进度
+                filled = int(20 * (current - 1) / total) if total > 0 else 0
+                bar = '=' * filled + '-' * (20 - filled)
+                console.print(Text(f"\r[{bar}] {finished + current - 1}/{total}    ", style="cyan"), end="")
 
-                # 获取单词 UUID
-                await ws.send('WEBSTUDY_GET_WORD')
-                resp = await asyncio.wait_for(ws.recv(), timeout=10)
-                if not isinstance(resp, bytes) or len(resp) < 38:
+                # 获取单词
+                word = await client.get_word()
+                if not word or not word.get("id"):
                     console.print(Text(f"\n[提示] 学习完成，没有更多单词", style="bright_green"))
                     break
 
-                ws_uuid = resp[2:38].decode('utf-8')
-
-                # 显示伪装日志 (用 UUID 前8位作为假单词)
-                fake_word = ws_uuid[:8]
-                disguise_templates = [
-                    '[{time}] [INFO] Loading package "{word}" (v3.2.1) successfully.',
-                    '[{time}] [DEBUG] Query SELECT * FROM vocabulary WHERE word="{word}" LIMIT 1;',
-                    '[{time}] [INFO] Module "{word}" imported successfully.',
-                ]
-                template = random.choice(disguise_templates)
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                log = template.format(time=timestamp, word=fake_word)
+                spelling = word.get("spelling", "")
+                phonetic = word.get("phonetic_us", "")
+                interpretation = word.get("interpretation", "")
 
                 # 换行后显示伪装日志
                 console.print()
-                parts = log.split('"')
-                if len(parts) >= 2:
-                    text = Text()
-                    text.append(parts[0] + '"', style="cyan")
-                    text.append(fake_word, style="bold bright_green")
-                    text.append('"' + parts[2], style="cyan")
-                    console.print(text)
-                else:
-                    console.print(Text(log, style="cyan"))
+                console.print(Text(f"[1] {spelling}", style="bold bright_green"))
+                if phonetic:
+                    console.print(Text(f"   {phonetic}", style="dim"))
+                if interpretation:
+                    console.print(Text(f"   {interpretation}", style="dim"))
 
                 console.print()
                 console.print(Text("[1] 认识   [2] 模糊   [3] 忘记   [q] 退出", style="dim"))
@@ -364,29 +226,27 @@ def main():
                 status = status_map[key]
 
                 # 提交反馈
-                data = {
-                    "voc_id": ws_uuid,
-                    "response": status,
-                    "recall_duration": random.randint(500, 2000),
-                    "study_duration": random.randint(1000, 3000),
-                    "study_method": "STUDY_CN_EN"
-                }
-                await ws.send(f'WEBSTUDY_SUBMIT_RESPONSE {json.dumps(data)}')
-                await asyncio.wait_for(ws.recv(), timeout=10)
+                ok = await client.submit_response(
+                    word_id=word["id"],
+                    response=status,
+                    recall_duration=2000,
+                    study_duration=3000
+                )
 
-                # 更新统计
-                learned.append({"word_id": ws_uuid, "status": status})
-                if status == "FAMILIAR":
-                    stats["known"] += 1
-                elif status == "VAGUE":
-                    stats["fuzzy"] += 1
-                else:
-                    stats["forgotten"] += 1
+                if ok:
+                    # 更新统计
+                    learned.append({"word_id": word["id"], "status": status, "spelling": spelling})
+                    if status == "FAMILIAR":
+                        stats["known"] += 1
+                    elif status == "VAGUE":
+                        stats["fuzzy"] += 1
+                    else:
+                        stats["forgotten"] += 1
 
-            except Exception as e:
-                console.print(Text(f"\n[错误] {e}", style="bold red"))
-            finally:
-                await ws.close()
+        except Exception as e:
+            console.print(Text(f"\n[错误] {e}", style="bold red"))
+        finally:
+            await client.close()
 
         return stats, learned
 
