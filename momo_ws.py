@@ -129,136 +129,268 @@ Exception: Database locked""",
 ]
 
 # ============================================================================
-# Protobuf 解析工具
+# Protobuf 二进制编解码 (手写最小实现，无需 protoc)
+#
+# 通过分析网页前端的 vendors.416116d4.js 还原:
+#   WebsocketProtocolMessage { 1:id(str) 2:reply_id(str) 3:event(int32) 4:data(bytes) 5:success(bool) }
+#   WsWebStudyInitStudyRequest {}
+#   WsWebStudyGetWordRequest { 1:back(bool) }
+#   WsWebStudySubmitResponseRequest { 1:voc_id(str) 2:response(int32 enum)
+#                                     3:study_method(int32 enum) 4:recall_duration(int32) 5:study_duration(int32) }
+#   WsWebStudyGetWordResponse { 1:word(WebStudyWord) 2:interpretations(repeated)
+#                               3:phrases 4:notes 23:study_time_ms }
+#   WebStudyWord { 1:id(str) 2:voc_id(int32) 3:spelling 4:phonetic_us 5:phonetic_uk 7:difficulty }
+#   WebStudyInterpretation { 1:id 2:voc_id 3:interpretation(str) }
+#   WsWebStudySubmitResponseResponse { 1:next(WsWebStudyGetWordResponse) }
 # ============================================================================
 
-def parse_varint(data: bytes, pos: int) -> tuple:
-    """解析 Varint，返回 (value, new_pos)"""
-    result = 0
-    shift = 0
-    while pos < len(data):
-        byte = data[pos]
+# WebsocketProtocolEvent 枚举
+EV_SYSTEM_READY = 1
+EV_SYSTEM_PING = 2
+EV_WEBSTUDY_INIT_STUDY = 1001
+EV_WEBSTUDY_GET_WORD = 1002
+EV_WEBSTUDY_SUBMIT_RESPONSE = 1003
+
+EVENT_NAMES = {
+    1: "SYSTEM_READY", 2: "SYSTEM_PING", 3: "SYSTEM_SUBSCRIBE_TOPICS",
+    1001: "WEBSTUDY_INIT_STUDY", 1002: "WEBSTUDY_GET_WORD", 1003: "WEBSTUDY_SUBMIT_RESPONSE",
+}
+
+# StudyResponse 枚举
+STUDY_RESPONSE = {"FAMILIAR": 1, "VAGUE": 2, "FORGET": 3, "WELL_FAMILIAR": 4, "CANCEL_WELL_FAMILIAR": 5}
+# StudyMethod 枚举
+STUDY_METHOD = {"STUDY_EN_CN": 0, "STUDY_CN_EN": 1}
+
+
+def _enc_varint(v: int) -> bytes:
+    """编码无符号 varint"""
+    out = bytearray()
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        if v:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def _enc_tag(field: int, wire: int) -> bytes:
+    return _enc_varint((field << 3) | wire)
+
+
+def _enc_string(field: int, s: str) -> bytes:
+    data = s.encode("utf-8")
+    return _enc_tag(field, 2) + _enc_varint(len(data)) + data
+
+
+def _enc_bytes(field: int, b: bytes) -> bytes:
+    return _enc_tag(field, 2) + _enc_varint(len(b)) + b
+
+
+def _enc_int32(field: int, v: int) -> bytes:
+    return _enc_tag(field, 0) + _enc_varint(v & 0xFFFFFFFFFFFFFFFF)
+
+
+def _enc_bool(field: int, v: bool) -> bytes:
+    return _enc_tag(field, 0) + _enc_varint(1 if v else 0)
+
+
+def _dec_varint(buf: bytes, pos: int):
+    """解码 varint，返回 (value, new_pos)"""
+    result, shift = 0, 0
+    while pos < len(buf):
+        b = buf[pos]
         pos += 1
-        result |= (byte & 0x7f) << shift
-        if not (byte & 0x80):
-            break
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return result, pos
         shift += 7
     return result, pos
 
-def parse_protobuf_string(data: bytes, pos: int) -> tuple:
-    """解析 Protobuf 字符串字段，返回 (string_value, new_pos)"""
-    length, pos = parse_varint(data, pos)
-    if pos + length > len(data):
-        return "", len(data)
-    return data[pos:pos+length].decode('utf-8', errors='replace'), pos + length
 
-def parse_protobuf_field(data: bytes, pos: int) -> tuple:
-    """解析一个 Protobuf 字段，返回 (field_number, wire_type, value, new_pos)"""
-    if pos >= len(data):
-        return None, None, None, pos
-
-    tag, pos = parse_varint(data, pos)
-    field_number = tag >> 3
-    wire_type = tag & 0x7
-
-    if wire_type == 0:  # Varint
-        value, pos = parse_varint(data, pos)
-    elif wire_type == 2:  # Length-delimited
-        value, pos = parse_protobuf_string(data, pos)
-    elif wire_type == 5:  # 32-bit
-        value = struct.unpack('<I', data[pos:pos+4])[0]
-        pos += 4
-    else:
-        value = None
-
-    return field_number, wire_type, value, pos
-
-def parse_word_response(data: bytes) -> Dict[str, Any]:
+def _decode_message(buf: bytes) -> Dict[int, list]:
     """
-    解析 GET_WORD 返回的 Protobuf 响应
-
-    响应格式 (根据 JS 代码分析):
-    message WsWebStudyGetWordResponse {
-        WordItem word = 1;
-        int64 study_time_ms = 2;
-    }
-
-    WordItem {
-        string id = 1;           // UUID
-        string spelling = 2;     // 单词拼写
-        string phonetic_us = 3;   // 美式音标
-        string phonetic_uk = 4;   // 英式音标
-        ... 更多字段
-    }
+    通用解码器：返回 {field_num: [value, value, ...]}
+    wire=0 -> int
+    wire=2 -> bytes (string 由调用者按需 decode)
+    wire=1 -> int (64bit, 当 raw bytes 处理)
+    wire=5 -> int (32bit)
     """
-    result = {
-        "id": "",
-        "spelling": "",
-        "phonetic_us": "",
-        "phonetic_uk": "",
-        "study_time_ms": 0,
-        "interpretation": "",
-        "difficulty": 0,
-    }
-
+    out: Dict[int, list] = {}
     pos = 0
-    current_field = None
-
-    while pos < len(data):
-        field_num, wire_type, value, pos = parse_protobuf_field(data, pos)
-        if field_num is None:
+    while pos < len(buf):
+        tag, pos = _dec_varint(buf, pos)
+        if tag == 0:
             break
-
-        # WordItem 的嵌套字段 (field 1)
-        if field_num == 1 and wire_type == 2:
-            # 嵌套的 WordItem
-            nested_pos = 0
-            nested_data = value if isinstance(value, bytes) else value.encode('utf-8') if isinstance(value, str) else b''
-            while nested_pos < len(nested_data):
-                nf_num, nf_wire, nf_value, nested_pos = parse_protobuf_field(nested_data, nested_pos)
-                if nf_num is None:
-                    break
-
-                if nf_num == 1:  # id
-                    result["id"] = nf_value
-                elif nf_num == 2:  # spelling
-                    result["spelling"] = nf_value
-                elif nf_num == 3:  # phonetic_us
-                    result["phonetic_us"] = nf_value
-                elif nf_num == 4:  # phonetic_uk
-                    result["phonetic_uk"] = nf_value
-                elif nf_num == 7:  # difficulty
-                    result["difficulty"] = nf_value
-                elif nf_num == 12:  # interpretation
-                    result["interpretation"] = nf_value
-
-        elif field_num == 2 and wire_type == 0:  # study_time_ms
-            result["study_time_ms"] = value
-
-    return result
+        field, wire = tag >> 3, tag & 7
+        if wire == 0:
+            val, pos = _dec_varint(buf, pos)
+        elif wire == 2:
+            length, pos = _dec_varint(buf, pos)
+            val = buf[pos:pos + length]
+            pos += length
+        elif wire == 1:
+            val = buf[pos:pos + 8]
+            pos += 8
+        elif wire == 5:
+            val = buf[pos:pos + 4]
+            pos += 4
+        else:
+            break
+        out.setdefault(field, []).append(val)
+    return out
 
 
-def parse_submit_response(data: bytes) -> Optional[Dict[str, Any]]:
+def _get_str(fields: Dict[int, list], num: int, default: str = "") -> str:
+    v = fields.get(num)
+    if not v:
+        return default
+    raw = v[0]
+    return raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+
+
+def _get_int(fields: Dict[int, list], num: int, default: int = 0) -> int:
+    v = fields.get(num)
+    return int(v[0]) if v else default
+
+
+def _get_bytes_list(fields: Dict[int, list], num: int) -> list:
+    return [v for v in fields.get(num, []) if isinstance(v, (bytes, bytearray))]
+
+
+# ----------------------------------------------------------------------------
+# 业务消息编码
+# ----------------------------------------------------------------------------
+
+def encode_envelope(msg_id: str, event: int, data: bytes = b"") -> bytes:
     """
-    解析 SUBMIT_RESPONSE 返回的 Protobuf 响应
-    包含下一个单词的信息
+    编码外壳 WebsocketProtocolMessage。
+
+    注意: JS encoder 对空 body 请求也会写 field 4 = 空 bytes (即 `22 00`)。
+    缺失 data 字段会被网关识别为"无 body"直接丢弃，必须显式写出来。
     """
-    result = parse_word_response(data)
-    return result if result.get("id") else None
+    out = b""
+    out += _enc_string(1, msg_id)
+    out += _enc_int32(3, event)
+    out += _enc_bytes(4, data)
+    out += _enc_bool(5, True)
+    return out
+
+
+def encode_get_word_request(back: bool) -> bytes:
+    if not back:
+        return b""
+    return _enc_bool(1, True)
+
+
+def encode_submit_request(voc_id: str, response: str, study_method: str,
+                          recall_duration: int, study_duration: int) -> bytes:
+    out = b""
+    if voc_id:
+        out += _enc_string(1, voc_id)
+    resp_n = STUDY_RESPONSE.get(response, 0)
+    if resp_n:
+        out += _enc_int32(2, resp_n)
+    sm_n = STUDY_METHOD.get(study_method, 0)
+    if sm_n:
+        out += _enc_int32(3, sm_n)
+    if recall_duration:
+        out += _enc_int32(4, recall_duration)
+    if study_duration:
+        out += _enc_int32(5, study_duration)
+    return out
+
+
+# ----------------------------------------------------------------------------
+# 业务消息解析
+# ----------------------------------------------------------------------------
+
+def parse_web_study_word(buf: bytes) -> Dict[str, Any]:
+    """解析 WebStudyWord"""
+    f = _decode_message(buf)
+    return {
+        "id": _get_str(f, 1),
+        "voc_id": _get_int(f, 2),
+        "spelling": _get_str(f, 3),
+        "phonetic_us": _get_str(f, 4),
+        "phonetic_uk": _get_str(f, 5),
+        "hyphenation": _get_str(f, 6),
+        "difficulty": _get_int(f, 7),
+    }
+
+
+def parse_get_word_response(buf: bytes) -> Dict[str, Any]:
+    """解析 WsWebStudyGetWordResponse"""
+    f = _decode_message(buf)
+    word_bufs = _get_bytes_list(f, 1)
+    word = parse_web_study_word(word_bufs[0]) if word_bufs else {}
+
+    interpretations = []
+    for ib in _get_bytes_list(f, 2):
+        fi = _decode_message(ib)
+        text = _get_str(fi, 3)
+        if text:
+            interpretations.append(text)
+
+    return {
+        "id": word.get("id", ""),
+        "voc_id": word.get("voc_id", 0),
+        "spelling": word.get("spelling", ""),
+        "phonetic_us": word.get("phonetic_us", ""),
+        "phonetic_uk": word.get("phonetic_uk", ""),
+        "difficulty": word.get("difficulty", 0),
+        "interpretation": "\n".join(interpretations),
+        "interpretations": interpretations,
+        "study_time_ms": _get_int(f, 23),
+    }
+
+
+def parse_envelope(buf: bytes) -> Dict[str, Any]:
+    """解析外壳 WebsocketProtocolMessage（含 errors 字段）"""
+    f = _decode_message(buf)
+    errors = []
+    for err_buf in _get_bytes_list(f, 6):
+        ef = _decode_message(err_buf)
+        # WebsocketProtocolError 至少包含 code/kind(string) 和 message(string)
+        err = {}
+        for fnum, vals in ef.items():
+            for v in vals:
+                if isinstance(v, (bytes, bytearray)):
+                    try:
+                        err[fnum] = v.decode("utf-8", errors="replace")
+                    except Exception:
+                        err[fnum] = repr(v)
+                else:
+                    err[fnum] = v
+        errors.append(err)
+    return {
+        "id": _get_str(f, 1),
+        "reply_id": _get_str(f, 2),
+        "event": _get_int(f, 3),
+        "data": (_get_bytes_list(f, 4)[0] if _get_bytes_list(f, 4) else b""),
+        "success": bool(_get_int(f, 5, 0)),
+        "errors": errors,
+    }
+
+
+# 向后兼容旧函数名
+def parse_word_response(data: bytes) -> Dict[str, Any]:
+    return parse_get_word_response(data)
 
 
 # ============================================================================
-# WebSocket 学习客户端 (完整协议)
+# WebSocket 学习客户端 (单连接 + 后台 recv loop + reply_id 路由)
 # ============================================================================
 
 class MaimemoWSClient:
     """
-    基于 WebSocket 的墨墨学习客户端
+    基于 WebSocket 的墨墨学习客户端 (纯二进制 Protobuf 协议)
 
-    协议分析结果:
-    - 连接: wss://tc-apis.maimemo.com/study/ws/webstudy?token=xxx
-    - 消息格式: 纯文本 action，或 action + JSON 数据
-    - 需要先发送 SYSTEM_PING 保持连接，然后 INIT_STUDY 初始化
+    - 单连接长期复用
+    - 后台 recv loop 持续解码服务端推送的 envelope
+    - SYSTEM_PING 自动二进制回复
+    - 业务请求通过 reply_id 路由到 Future
     """
 
     def __init__(self, api_token: str):
@@ -266,25 +398,46 @@ class MaimemoWSClient:
         self.ws = None
         self._create_ssl_context()
         self._connected = False
-        self._reply_id = 0
+        self._msg_seq = 0
+        self._pending: Dict[str, asyncio.Future] = {}
+        self._recv_task: Optional[asyncio.Task] = None
+        self._initialized = False
+        self._init_payload: Optional[bytes] = None
+        self._ready_event: Optional[asyncio.Event] = None
+        # 反作弊：服务端会检查 study_duration <= 实际从 get_word 到 submit 的时间
+        self._last_word_received_at: Optional[float] = None
+        self.last_next_word: Optional[Dict[str, Any]] = None
 
     def _create_ssl_context(self):
-        """创建 SSL 上下文 (处理 macOS 证书问题)"""
         self.ssl_ctx = ssl.create_default_context()
         self.ssl_ctx.check_hostname = False
         self.ssl_ctx.verify_mode = ssl.CERT_NONE
 
-    def _next_reply_id(self) -> str:
-        """生成唯一的 reply_id"""
-        self._reply_id += 1
-        return str(self._reply_id)
+    def _next_id(self) -> str:
+        self._msg_seq += 1
+        return f"req-{self._msg_seq}"
 
     async def connect(self) -> bool:
-        """建立 WebSocket 连接"""
+        """
+        建立 WebSocket 连接，启动后台 recv loop。
+
+        必须等到 SYSTEM_READY 收到后才返回——否则后续业务请求会被网关以
+        `study_internal_error` 拒绝。
+        """
+        if self._connected and self.ws is not None:
+            return True
         url = f"{WS_URL}?token={self.api_token}"
         try:
             self.ws = await websockets.connect(url, ssl=self.ssl_ctx)
             self._connected = True
+            self._ready_event = asyncio.Event()
+            self._recv_task = asyncio.create_task(self._recv_loop())
+            try:
+                await asyncio.wait_for(self._ready_event.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                print("[错误] 等待 SYSTEM_READY 超时")
+                await self.close()
+                return False
             return True
         except Exception as e:
             print(f"[错误] WebSocket 连接失败: {e}")
@@ -292,87 +445,133 @@ class MaimemoWSClient:
             return False
 
     async def close(self):
-        """关闭连接"""
-        if self.ws:
-            await self.ws.close()
-            self.ws = None
-            self._connected = False
-
-    async def _wait_for_event(self, event: str, timeout: float = 10) -> Optional[Dict]:
-        """等待特定的事件"""
-        start_time = time.time()
-        while time.time() - start_time < timeout:
+        self._connected = False
+        if self._recv_task and not self._recv_task.done():
+            self._recv_task.cancel()
             try:
-                response = await asyncio.wait_for(self.ws.recv(), timeout=timeout)
-                # 解析响应 - 可能是文本或二进制
-                if isinstance(response, str):
-                    # 可能是 ping 或其他文本消息
-                    if "SYSTEM_PING" in response:
-                        await self.ws.send('{"event":"SYSTEM_PING","data":{}}')
-                        continue
-                # 返回原始响应供调用者处理
-                return response
-            except asyncio.TimeoutError:
-                continue
-        return None
+                await self._recv_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self.ws:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+        self.ws = None
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(ConnectionError("连接已关闭"))
+        self._pending.clear()
+
+    async def _send_envelope(self, msg_id: str, event: int, data: bytes = b""):
+        """发送一个 envelope"""
+        frame = encode_envelope(msg_id, event, data)
+        await self.ws.send(frame)
+
+    async def _reply_ping(self, ping_id: str):
+        """回复 SYSTEM_PING：把对方的 id 放进 reply_id，event=SYSTEM_PING"""
+        out = b""
+        out += _enc_string(2, ping_id)
+        out += _enc_int32(3, EV_SYSTEM_PING)
+        out += _enc_bool(5, True)
+        try:
+            await self.ws.send(out)
+        except Exception:
+            pass
+
+    async def _recv_loop(self):
+        """后台读帧：分发给 pending future 或处理系统事件"""
+        try:
+            while self._connected and self.ws is not None:
+                try:
+                    frame = await self.ws.recv()
+                except websockets.exceptions.ConnectionClosed:
+                    break
+                if not isinstance(frame, (bytes, bytearray)):
+                    continue
+                env = parse_envelope(bytes(frame))
+                event = env["event"]
+                reply_id = env["reply_id"]
+                msg_id = env["id"]
+                if os.environ.get("MOFISH_WS_TRACE"):
+                    print(f"[trace] recv frame_len={len(frame)} event={event} reply_id={reply_id!r} msg_id={msg_id!r} data_len={len(env['data'])}  raw_head={bytes(frame)[:30].hex()}  pending={list(self._pending.keys())}")
+
+                # SYSTEM_PING -> 自动回复
+                if event == EV_SYSTEM_PING:
+                    await self._reply_ping(msg_id)
+                    continue
+
+                # SYSTEM_READY: 服务端在连接建立时主动推送
+                if event == EV_SYSTEM_READY:
+                    if self._ready_event is not None:
+                        self._ready_event.set()
+                    continue
+
+                # 业务响应：通过 reply_id 路由
+                if reply_id and reply_id in self._pending:
+                    fut = self._pending.pop(reply_id)
+                    if not fut.done():
+                        fut.set_result(env)
+                    continue
+
+                # 服务端主动推送的 INIT 数据 (没有 reply_id 时)
+                if event == EV_WEBSTUDY_INIT_STUDY:
+                    self._init_payload = env["data"]
+                    self._initialized = True
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"[警告] recv loop 异常: {e}")
+        finally:
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.set_exception(ConnectionError("连接已断开"))
+            self._pending.clear()
+
+    async def _request(self, event: int, data: bytes = b"", timeout: float = 10) -> Optional[Dict[str, Any]]:
+        """通用请求-响应：发送 envelope，按 reply_id 等待"""
+        if not self._connected or self.ws is None:
+            print("[错误] WebSocket 未连接")
+            return None
+        msg_id = self._next_id()
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending[msg_id] = fut
+        try:
+            await self._send_envelope(msg_id, event, data)
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._pending.pop(msg_id, None)
+            print(f"[错误] {EVENT_NAMES.get(event, event)} 超时")
+            return None
+        except Exception as e:
+            self._pending.pop(msg_id, None)
+            print(f"[错误] {EVENT_NAMES.get(event, event)} 失败: {e}")
+            return None
+
+    async def initialize(self) -> bool:
+        """init_study 的别名"""
+        return await self.init_study()
 
     async def init_study(self) -> bool:
-        """
-        初始化学习会话
-
-        需要在 GET_WORD 之前调用
-        """
-        try:
-            # 发送 INIT_STUDY
-            await self.ws.send('WEBSTUDY_INIT_STUDY {}')
-
-            # 等待响应
-            response = await asyncio.wait_for(self.ws.recv(), timeout=10)
-            return True
-
-        except asyncio.TimeoutError:
-            print("[错误] 初始化学习超时")
+        """初始化学习会话 (WEBSTUDY_INIT_STUDY)"""
+        env = await self._request(EV_WEBSTUDY_INIT_STUDY, b"", timeout=15)
+        if env is None:
             return False
-        except Exception as e:
-            print(f"[错误] 初始化学习失败: {e}")
-            return False
+        self._initialized = True
+        self._init_payload = env.get("data", b"")
+        return True
 
-    async def get_word(self) -> Optional[Dict[str, Any]]:
-        """
-        获取一个单词（完整信息）
-
-        返回:
-            Dict 包含: id, spelling, phonetic_us, phonetic_uk, interpretation, difficulty
-            或 None 如果失败
-        """
-        # 建立新连接
-        if not await self.connect():
+    async def get_word(self, back: bool = False) -> Optional[Dict[str, Any]]:
+        """拉取下一个单词 (WEBSTUDY_GET_WORD)"""
+        data = encode_get_word_request(back)
+        env = await self._request(EV_WEBSTUDY_GET_WORD, data, timeout=10)
+        if env is None:
             return None
-
-        try:
-            # 发送 GET_WORD (纯文本)
-            await self.ws.send('WEBSTUDY_GET_WORD')
-
-            # 接收响应 (二进制 protobuf)
-            response = await asyncio.wait_for(self.ws.recv(), timeout=10)
-
-            # 解析 Protobuf 响应
-            if isinstance(response, bytes):
-                word_data = parse_word_response(response)
-                return word_data
-            else:
-                # 如果是文本，尝试解析（不应该发生）
-                print(f"[警告] 收到意外文本响应: {response[:100]}")
-                return None
-
-        except asyncio.TimeoutError:
-            print("[错误] 获取单词超时")
-            return None
-        except Exception as e:
-            print(f"[错误] 获取单词失败: {e}")
-            return None
-        finally:
-            await self.close()
+        result = parse_get_word_response(env.get("data", b""))
+        if result.get("id"):
+            self._last_word_received_at = time.monotonic()
+        return result
 
     async def submit_response(
         self,
@@ -380,77 +579,45 @@ class MaimemoWSClient:
         response: str = "FAMILIAR",
         recall_duration: int = 1000,
         study_duration: int = 2000,
-        study_method: str = "STUDY_CN_EN"
+        study_method: str = "STUDY_CN_EN",
     ) -> bool:
         """
-        提交学习反馈
+        提交学习反馈 (WEBSTUDY_SUBMIT_RESPONSE)
+
+        返回 True 表示服务端接受。响应内嵌的下一个单词存在 self.last_next_word 里供调用方读取。
         """
-        # 建立新连接
-        if not await self.connect():
+        # 反作弊封顶: study_duration 不能超过实际从 GET_WORD 到现在的经过时间
+        if self._last_word_received_at is not None:
+            elapsed_ms = int((time.monotonic() - self._last_word_received_at) * 1000)
+            # 留 100ms 余量给网络抖动
+            cap_ms = max(0, elapsed_ms - 100)
+            if study_duration > cap_ms:
+                study_duration = cap_ms
+            if recall_duration > cap_ms:
+                recall_duration = cap_ms
+
+        data = encode_submit_request(
+            voc_id=word_id,
+            response=response,
+            study_method=study_method,
+            recall_duration=recall_duration,
+            study_duration=study_duration,
+        )
+        env = await self._request(EV_WEBSTUDY_SUBMIT_RESPONSE, data, timeout=10)
+        if env is None:
             return False
-
-        try:
-            # 构造 JSON 数据
-            data = {
-                "voc_id": word_id,
-                "response": response,
-                "recall_duration": recall_duration,
-                "study_duration": study_duration,
-                "study_method": study_method
-            }
-
-            # 发送 SUBMIT_RESPONSE + JSON
-            message = f'WEBSTUDY_SUBMIT_RESPONSE {json.dumps(data)}'
-            await self.ws.send(message)
-
-            # 接收响应
-            response = await asyncio.wait_for(self.ws.recv(), timeout=10)
-
-            return True
-
-        except asyncio.TimeoutError:
-            print("[错误] 提交反馈超时")
+        if not env.get("success", True):
+            print(f"[错误] SUBMIT_RESPONSE 被服务端拒绝: {env.get('errors')}")
+            self.last_next_word = None
             return False
-        except Exception as e:
-            print(f"[错误] 提交反馈失败: {e}")
-            return False
-        finally:
-            await self.close()
-
-    async def query_word(self, word_id: str) -> Optional[Dict[str, Any]]:
-        """
-        查询单词详情
-
-        参数:
-            word_id: 单词ID (UUID)
-        返回:
-            单词详情Dict 或 None
-        """
-        if not await self.connect():
-            return None
-
-        try:
-            # 发送 QUERY_WORD 请求
-            data = {"voc_id": word_id}
-            message = f'WEBSTUDY_QUERY_WORD {json.dumps(data)}'
-            await self.ws.send(message)
-
-            # 接收响应
-            response = await asyncio.wait_for(self.ws.recv(), timeout=10)
-
-            if isinstance(response, bytes):
-                return parse_word_response(response)
-
-            return None
-
-        except asyncio.TimeoutError:
-            print("[错误] 查询单词超时")
-            return None
-        except Exception as e:
-            print(f"[错误] 查询单词失败: {e}")
-            return None
-        finally:
-            await self.close()
+        # SubmitResponse 内嵌 next=WsWebStudyGetWordResponse (field 1)
+        body = _decode_message(env.get("data", b""))
+        next_bufs = _get_bytes_list(body, 1)
+        self.last_next_word = parse_get_word_response(next_bufs[0]) if next_bufs else None
+        # submit 成功后，下一个单词等价于刚被推送过来——重置计时基准
+        if self.last_next_word and self.last_next_word.get("id"):
+            self._last_word_received_at = time.monotonic()
+        return True
 
 
 # ============================================================================
@@ -667,6 +834,11 @@ async def run_study(client: MaimemoWSClient, console: Console):
     """运行学习循环"""
     stealth = StealthConsole(console)
 
+    # 必须先初始化学习会话
+    if not await client.init_study():
+        console.print(Text("\n[错误] 初始化学习会话失败", style="bold red"))
+        return
+
     # 学习状态统计
     stats = {"known": 0, "fuzzy": 0, "forgotten": 0}
     current_index = 0
@@ -744,7 +916,7 @@ async def run_study(client: MaimemoWSClient, console: Console):
 
 
 async def verify_ws_token(token: str) -> bool:
-    """验证 WebSocket token 是否有效"""
+    """验证 WebSocket token 是否有效（仅检查能否建立连接）"""
     ssl_ctx = ssl.create_default_context()
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
@@ -752,17 +924,12 @@ async def verify_ws_token(token: str) -> bool:
     url = f"{WS_URL}?token={token}"
     try:
         async with websockets.connect(url, ssl=ssl_ctx, open_timeout=5) as ws:
-            # 尝试发送 GET_WORD
-            await ws.send('WEBSTUDY_GET_WORD')
-            # 等待响应
             try:
-                resp = await asyncio.wait_for(ws.recv(), timeout=5)
-                # 如果收到响应而不是关闭连接，说明 token 有效
+                await asyncio.wait_for(ws.recv(), timeout=3)
                 return True
             except asyncio.TimeoutError:
-                return True  # 超时也认为可能有效
+                return True
     except websockets.exceptions.ConnectionClosed as e:
-        # 检查是否是认证错误
         if e.code == 3401 or "3401" in str(e):
             return False
         return False
@@ -813,16 +980,16 @@ async def main_async():
 
     print(Text("[14:00:00] [DEBUG] Connecting to WebSocket...", style="dim"))
 
-    # 测试连接
     if not await client.connect():
         sys.exit(1)
 
-    await client.close()
     print(Text("[14:00:00] [INFO] Connected successfully", style="cyan"))
     time.sleep(0.5)
 
-    # 运行学习
-    await run_study(client, console)
+    try:
+        await run_study(client, console)
+    finally:
+        await client.close()
 
     console.print(Text("[INFO] Session closed. Goodbye!", style="dim"))
     time.sleep(1)
