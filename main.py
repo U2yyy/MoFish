@@ -500,12 +500,18 @@ def main():
     console.print(Text(f"  今日进度: {finished}/{total} 词 (剩余 {remaining} 词)", style="bold cyan"))
     console.print(Text("=" * 50, style="dim"))
     console.print()
-    console.print(Text("  按 [y] 开始背词  /  其他键退出", style="dim"))
 
-    ch = read_key().lower()
-    if ch != "y":
-        console.print(Text("已取消", style="dim"))
-        return
+    while True:
+        console.print(Text("  按 [y] 开始背词  /  [s] 设置  /  其他键退出", style="dim"))
+        ch = read_key().lower()
+        if ch == "s":
+            run_settings(config, CONFIG_FILE, console)
+            continue
+        elif ch == "y":
+            break
+        else:
+            console.print(Text("已取消", style="dim"))
+            return
 
     console.clear()
     console.print(Text(f"[{_now()}] [INFO] Starting WebSocket learning session...", style="cyan"))
@@ -741,6 +747,62 @@ def print_stats(data_dir: str, days: Optional[int]):
             bar_str = f"{day_str} {bar} {cnt}"
         console.print(Text(bar_str, style="cyan"))
     console.print()
+
+
+# ============================================================================
+# 交互式设置
+# ============================================================================
+
+def _render_settings_page(record: bool, hide_hint: bool) -> None:
+    """渲染设置页。"""
+    console = Console()
+    console.clear()
+    console.print(Text("─── MoFish 设置 ───", style="bold cyan"))
+    console.print()
+    cur = "[已开启]" if record else "[已关闭]"
+    console.print(Text(f"  [1] 学习记录写入 data/sessions.jsonl   {cur}", style="white"))
+    console.print(Text("     开启后每次成功背词会记录一条 JSONL", style="dim"))
+    console.print()
+    cur2 = "[已开启]" if hide_hint else "[已关闭]"
+    console.print(Text(f"  [2] 隐藏判答屏底部提示              {cur2}", style="white"))
+    console.print(Text("     开启后不再显示 [1] 认识 [2] 模糊 [3] 忘记", style="dim"))
+    console.print()
+    console.print(Text("  按 [1] / [2] 切换     按 [q] 返回", style="dim"))
+
+
+def run_settings(config: Dict[str, Any], config_file: str, console: Console) -> None:
+    """交互式设置页，修改后直接持久化到 config.json。"""
+    record = config.get("record_enabled", False)
+    hide_hint = config.get("hide_judge_hint", False)
+
+    while True:
+        _render_settings_page(record, hide_hint)
+        k = read_key().lower()
+        if k == "1":
+            record = not record
+        elif k == "2":
+            hide_hint = not hide_hint
+        elif k == "q":
+            # 退出前持久化最新状态
+            config["record_enabled"] = record
+            config["hide_judge_hint"] = hide_hint
+            try:
+                with open(config_file, "w", encoding="utf-8") as f:
+                    json.dump(config, f, ensure_ascii=False, indent=4)
+            except Exception:
+                pass
+            return
+        else:
+            continue
+
+        # 每次切换后立即保存
+        config["record_enabled"] = record
+        config["hide_judge_hint"] = hide_hint
+        try:
+            with open(config_file, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=4)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
