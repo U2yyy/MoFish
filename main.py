@@ -268,11 +268,15 @@ def load_config() -> Dict[str, Any]:
 async def learning_loop(client: MaimemoWSClient, console: Console,
                         finished: int, total: int, data_dir: str,
                         record_enabled: bool = False,
-                        hide_judge_hint: bool = False) -> Dict[str, Any]:
+                        hide_judge_hint: bool = False,
+                        add_count: int = 0) -> Dict[str, Any]:
     """
     两屏式背词循环。
       Phase 1 (recall): 伪装日志显示拼写, 等用户按任意键(b=boss, q=退出)显示释义
       Phase 2 (judge): 显示释义, 等 1/2/3 判答, 提交云端
+
+    ``add_count > 0`` 时在 init_study 之后、第一次 get_word 之前从绑定词本
+    再舀 ``add_count`` 个词进入今日队列。
     """
     stats = {"known": 0, "fuzzy": 0, "forgotten": 0}
     learned: List[Dict] = []
@@ -285,6 +289,16 @@ async def learning_loop(client: MaimemoWSClient, console: Console,
         if not await client.initialize():
             console.print(Text("[错误] 学习会话初始化失败", style="bold red"))
             return {"stats": stats, "learned": learned}
+
+        if add_count > 0:
+            console.print(Text(f"[{_now()}] [INFO] Adding {add_count} words from notepad...", style="cyan"))
+            added = await client.add_words(add_count)
+            if added is None:
+                console.print(Text(f"[{_now()}] [WARN] add_words failed; continuing", style="yellow"))
+            else:
+                console.print(Text(f"[{_now()}] [INFO] Added {added} words to today's queue", style="cyan"))
+                total += added
+            time.sleep(0.3)
 
         word = await client.get_word()
 
@@ -486,30 +500,53 @@ def main():
 
     console.print(Text(f"[{_now()}] [INFO] Progress: {finished}/{total}, study time: {study_minutes}min", style="cyan"))
 
-    if total > 0 and finished >= total:
-        console.print()
-        console.print(Text("=" * 50, style="dim"))
+    remaining = max(0, total - finished)
+    all_done = total > 0 and finished >= total
+    add_count = 0
+
+    console.print()
+    console.print(Text("=" * 50, style="dim"))
+    if all_done:
         console.print(Text("  今日任务已全部完成", style="bright_green"))
         console.print(Text(f"  已学习: {finished} 词  |  学习时长: {study_minutes} 分钟", style="dim"))
-        console.print(Text("=" * 50, style="dim"))
-        return
-
-    remaining = total - finished
-    console.print()
-    console.print(Text("=" * 50, style="dim"))
-    console.print(Text(f"  今日进度: {finished}/{total} 词 (剩余 {remaining} 词)", style="bold cyan"))
+    else:
+        console.print(Text(f"  今日进度: {finished}/{total} 词 (剩余 {remaining} 词)", style="bold cyan"))
     console.print(Text("=" * 50, style="dim"))
     console.print()
 
-    while True:
-        console.print(Text("  按 [y] 开始背词  /  [s] 设置  /  其他键退出", style="dim"))
-        ch = read_key().lower()
-        if ch == "s":
-            run_settings(config, CONFIG_FILE, console)
-            continue
-        elif ch == "y":
+    if all_done:
+        # 今日已学完，唯一有意义的动作是从词本再舀些新词
+        while True:
+            prompt = "  从词本添加新词数量 (1-1000, 回车=不加直接退出, s=设置): "
+            try:
+                raw = input(prompt).strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                console.print(Text("已退出", style="dim"))
+                return
+            if raw == "s":
+                run_settings(config, CONFIG_FILE, console)
+                continue
+            if raw in ("", "q", "quit", "exit"):
+                return
+            try:
+                n = int(raw)
+            except ValueError:
+                console.print(Text("  请输入数字 1-1000，或 s / q", style="yellow"))
+                continue
+            if n < 1 or n > 1000:
+                console.print(Text("  数量需要在 1-1000 之间", style="yellow"))
+                continue
+            add_count = n
             break
-        else:
+    else:
+        while True:
+            console.print(Text("  按 [y] 开始背词  /  [s] 设置  /  其他键退出", style="dim"))
+            ch = read_key().lower()
+            if ch == "s":
+                run_settings(config, CONFIG_FILE, console)
+                continue
+            if ch == "y":
+                break
             console.print(Text("已取消", style="dim"))
             return
 
@@ -520,7 +557,8 @@ def main():
     client = MaimemoWSClient(ws_token)
     result = asyncio.run(learning_loop(client, console, finished, total, data_dir,
                                       record_enabled=config.get("record_enabled", False),
-                                      hide_judge_hint=config.get("hide_judge_hint", False)))
+                                      hide_judge_hint=config.get("hide_judge_hint", False),
+                                      add_count=add_count))
     stats = result["stats"]
     learned = result["learned"]
 

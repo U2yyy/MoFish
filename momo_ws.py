@@ -52,6 +52,7 @@ EV_SYSTEM_PING = 2
 EV_WEBSTUDY_INIT_STUDY = 1001
 EV_WEBSTUDY_GET_WORD = 1002
 EV_WEBSTUDY_SUBMIT_RESPONSE = 1003
+EV_WEBSTUDY_ADD_WORDS = 1011
 
 EVENT_NAMES: Dict[int, str] = {
     1: "SYSTEM_READY",
@@ -60,6 +61,7 @@ EVENT_NAMES: Dict[int, str] = {
     1001: "WEBSTUDY_INIT_STUDY",
     1002: "WEBSTUDY_GET_WORD",
     1003: "WEBSTUDY_SUBMIT_RESPONSE",
+    1011: "WEBSTUDY_ADD_WORDS",
 }
 
 # 学习反馈枚举
@@ -201,6 +203,18 @@ def encode_submit_request(
     if study_duration:
         out += _enc_int32(5, study_duration)
     return out
+
+
+def encode_add_words_request(count: int, mode: int = 2) -> bytes:
+    """
+    ``WEBSTUDY_ADD_WORDS`` 请求体。
+
+    body = { field 2: { field 1: count, field 2: mode } }
+    服务端从已绑定词本里舀 ``count`` 个词进入今日队列。``mode`` 实测固定 2，
+    其他取值的语义未知，调用方暂统一传 2。
+    """
+    inner = _enc_int32(1, count) + _enc_int32(2, mode)
+    return _enc_bytes(2, inner)
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +493,22 @@ class MaimemoWSClient:
         """``WEBSTUDY_INIT_STUDY`` —— 学习会话握手。"""
         env = await self._request(EV_WEBSTUDY_INIT_STUDY, b"", timeout=15)
         return env is not None
+
+    async def add_words(self, count: int, mode: int = 2) -> Optional[int]:
+        """
+        ``WEBSTUDY_ADD_WORDS`` —— 从已绑定词本舀 ``count`` 个词到今日队列。
+
+        返回服务端确认实际加入的数量；失败返回 ``None``。
+        client 不指定具体 voc_id，由服务端按词本顺序挑词。
+        """
+        if count <= 0:
+            return 0
+        data = encode_add_words_request(count, mode)
+        env = await self._request(EV_WEBSTUDY_ADD_WORDS, data, timeout=15)
+        if env is None or not env.get("success"):
+            return None
+        f = _decode_message(env.get("data", b""))
+        return _get_int(f, 1)
 
     async def get_word(self, back: bool = False) -> Optional[Dict[str, Any]]:
         """``WEBSTUDY_GET_WORD`` —— 拉取下一个待背单词。"""
