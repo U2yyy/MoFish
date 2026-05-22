@@ -378,10 +378,24 @@ class MaimemoWSClient:
         await self.ws.send(encode_envelope(msg_id, event, data))
 
     async def _reply_ping(self, ping_id: str):
-        """对方 PING 的 id 进 reply_id，event 同样为 SYSTEM_PING。"""
+        """
+        回应服务端 PING。
+
+        抓包实证 web 端的 PONG 字节布局（46 字节）：
+            0a 00   field 1 = "" (空 id)
+            12 24 ...  field 2 = reply_id (UUID 36 字符)
+            18 02   field 3 = SYSTEM_PING(2)
+            22 00   field 4 = "" (空 bytes，**必须写**)
+            28 01   field 5 = success(true)
+
+        缺 ``field 4`` 服务端会把帧视为脏帧丢弃，几次心跳没回就被踢——
+        和 INIT_STUDY 那个 ``22 00`` 是一个坑。
+        """
         frame = (
-            _enc_string(2, ping_id)
+            _enc_string(1, "")
+            + _enc_string(2, ping_id)
             + _enc_int32(3, EV_SYSTEM_PING)
+            + _enc_bytes(4, b"")
             + _enc_bool(5, True)
         )
         try:
