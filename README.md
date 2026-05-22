@@ -252,31 +252,44 @@ WEBSTUDY_SUBMIT_RESPONSE = 1003
    PING 帧的 `id` 要原样塞进 `reply_id`，`event` 仍是 `2`，自己也要
    `success=true`。不应答会被踢链接。
 
-### 3. 反作弊：study_duration 封顶
+### 3. 反作弊：两段独立计时，sum ≤ elapsed
 
-这是最烦的一个点。`WEBSTUDY_SUBMIT_RESPONSE` 提交时如果填了一个
-"漂亮的"假时间（比如 5000ms），服务端会回：
+最烦的一个点，前后改了两版才对上。`WEBSTUDY_SUBMIT_RESPONSE` 提交时如果
+时间值不对，服务端会回：
 
 ```
 webstudy_invalid_param  detail="study duration illegal"
 ```
 
-经过若干次二分测试，结论是：服务端记录了 `GET_WORD` 下发的时刻
-（或者 client 自报的 client timestamp，没继续深挖），`study_duration`
-和 `recall_duration` 都不能超过 **从那一刻到 submit 的实际墙钟时间**。
+抓 web 端一次 VAGUE 提交的原始包解出来：
 
-客户端实现里：
-
-```python
-# momo_ws.py
-elapsed_ms = int((time.monotonic() - self._last_word_received_at) * 1000)
-cap_ms = max(0, elapsed_ms - 100)   # 留 100ms 网络抖动
-study_duration = min(study_duration, cap_ms)
-recall_duration = min(recall_duration, cap_ms)
+```
+field 4 recall_duration: 2030 ms
+field 5 study_duration:  767  ms
 ```
 
-调用方可以乐观地传一个目标值（比如 `random.randint(2000, 9000)`），
-封顶逻辑会保证不踩雷。
+**两个字段是两段独立计时，不是同义词**：
+
+- `recall_duration` = 第一屏（看单词、回忆释义）耗时
+- `study_duration`  = 第二屏（看到答案、按 1/2/3）耗时
+
+合在一起必须 ≤ 自 `GET_WORD` 到 `SUBMIT` 的真实墙钟时。
+所以客户端正确的做法是 **实测两段时间**：
+
+```python
+# main.py
+recall_start = time.monotonic()
+read_key()                              # 用户翻面
+recall_duration_ms = int((time.monotonic() - recall_start) * 1000)
+
+judge_start = time.monotonic()
+while True:
+    if read_key() in ("1", "2", "3"): break
+study_duration_ms = int((time.monotonic() - judge_start) * 1000)
+```
+
+`momo_ws.py` 里还留了一层兜底：太快 (< 300ms) 顶到最小值、sum 超预算等比例
+缩、缩完还超就 `asyncio.sleep` 把预算挣回来。
 
 ### 4. SUBMIT 响应自带下一个词
 
@@ -284,7 +297,26 @@ recall_duration = min(recall_duration, cap_ms)
 `WsWebStudyGetWordResponse`。意味着稳态学习循环里你 **不需要** 再单独
 发一次 `GET_WORD`——直接读响应里的 next 就行。少一个 round trip。
 
-完整定义见 [`maimemo.proto`](./maimemo.proto)。
+### 5. 服务端权威进度藏在 field 22
+
+最初以为想拿"今日已学/总数"只能去 REST 的 `get_study_progress`。后来从
+SUBMIT 响应的 next-word 里解出 `GetWordResponse.field 22`，5 字节就是一个
+嵌套 message：
+
+```
+field 22 (progress sub-message):
+    field 1 int32 = finished
+    field 2 int32 = total
+```
+
+**每次取词、每次成功提交都带**。这意味着：
+
+- 不需要每词一次 REST 调用就能维护实时进度；
+- 客户端不要自己数"学了几个"——服务端的规则是 **只有 FAMILIAR 推进 finished，
+  VAGUE/FORGET 把单词压回队列但不计数**。本仓库现在的进度条完全由
+  `client.progress` 驱动，UI 永远跟服务端对齐。
+
+完整 proto 定义见 [`maimemo.proto`](./maimemo.proto)。
 
 ---
 

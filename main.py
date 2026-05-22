@@ -269,18 +269,26 @@ async def learning_loop(client: MaimemoWSClient, console: Console,
             return {"stats": stats, "learned": learned}
 
         word = await client.get_word()
-        idx = 0
 
         while word and word.get("id"):
-            idx += 1
-            current_global = finished + idx
+            # 服务端权威进度（WS 自带，VAGUE/FORGET 不会推进 finished）
+            srv_finished = client.progress.get("finished", finished)
+            srv_total = client.progress.get("total", total) or 1
+            # 当前正在背的这一个：finished 还没 +1，所以显示 +1 让进度条不挂在上一个数
+            current_global = srv_finished + 1
 
             # ---------- 渲染进度 + 第一屏 ----------
             console.clear()
-            filled = int(20 * current_global / total) if total > 0 else 0
+            filled = int(20 * current_global / srv_total) if srv_total > 0 else 0
             bar = "=" * filled + "-" * (20 - filled)
-            console.print(Text(f"[{bar}] {current_global}/{total}", style="cyan"))
+            console.print(Text(f"[{bar}] {current_global}/{srv_total}", style="cyan"))
             console.print()
+
+            # 上一轮 submit 的错误持久化提示一次，避免被 clear 吞掉
+            if client.last_error:
+                console.print(Text(f"  [!] 上一次提交失败: {client.last_error}", style="bold yellow"))
+                console.print()
+                client.last_error = ""
 
             # 上方铺几行假日志，真单词永远是最后一行——用户视线落到提示之上即可
             noise_pool = [
@@ -299,6 +307,8 @@ async def learning_loop(client: MaimemoWSClient, console: Console,
             ))
 
             # ---------- 第一屏交互：等用户回忆 ----------
+            # 实测 recall_duration（看单词到揭开答案这段）
+            recall_start = time.monotonic()
             recall_key = read_key()
             if recall_key.lower() == "q":
                 break
@@ -307,6 +317,7 @@ async def learning_loop(client: MaimemoWSClient, console: Console,
                 read_key()
                 # boss 之后回到当前单词，重画
                 continue
+            recall_duration_ms = int((time.monotonic() - recall_start) * 1000)
 
             # ---------- 第二屏：显示释义 + 等判答 ----------
             console.print()
@@ -317,6 +328,8 @@ async def learning_loop(client: MaimemoWSClient, console: Console,
                 style="dim",
             ))
 
+            # 实测 study_duration（看答案到按 1/2/3 这段）
+            judge_start = time.monotonic()
             while True:
                 k = read_key()
                 kl = k.lower()
@@ -327,23 +340,25 @@ async def learning_loop(client: MaimemoWSClient, console: Console,
                     read_key()
                     # boss 之后重画当前答案屏
                     console.clear()
-                    console.print(Text(f"[{bar}] {current_global}/{total}", style="cyan"))
+                    console.print(Text(f"[{bar}] {current_global}/{srv_total}", style="cyan"))
                     console.print()
                     render_answer_panel(console, word)
                     console.print()
                     console.print(Text("  [1] 认识   [2] 模糊   [3] 忘记   [b] boss   [q] save & quit", style="dim"))
+                    judge_start = time.monotonic()  # 重计时
                     continue
                 if kl in ("1", "2", "3"):
                     status = {"1": "FAMILIAR", "2": "VAGUE", "3": "FORGET"}[kl]
                     break
+            study_duration_ms = int((time.monotonic() - judge_start) * 1000)
 
             # ---------- 提交反馈 ----------
-            # duration 由 client 内部按真实经过时间封顶，这里给较大的目标值即可
+            # duration 是 web 端语义下的两段实测值；client 只做兜底
             ok = await client.submit_response(
                 word_id=word["id"],
                 response=status,
-                recall_duration=random.randint(800, 4000),
-                study_duration=random.randint(2000, 9000),
+                recall_duration=recall_duration_ms,
+                study_duration=study_duration_ms,
                 study_method="STUDY_EN_CN",
             )
 

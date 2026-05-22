@@ -221,7 +221,13 @@ def parse_web_study_word(buf: bytes) -> Dict[str, Any]:
 
 
 def parse_get_word_response(buf: bytes) -> Dict[str, Any]:
-    """``WsWebStudyGetWordResponse``: word + repeated interpretation + study_time。"""
+    """
+    ``WsWebStudyGetWordResponse``: word + interpretations + study_time + progress。
+
+    抓包实证 field 22 是服务端权威进度（嵌套 message）：
+      field 1 = finished
+      field 2 = total
+    """
     f = _decode_message(buf)
     word_bufs = _get_bytes_list(f, 1)
     word = parse_web_study_word(word_bufs[0]) if word_bufs else {}
@@ -233,6 +239,15 @@ def parse_get_word_response(buf: bytes) -> Dict[str, Any]:
         if text:
             interpretations.append(text)
 
+    progress: Dict[str, int] = {}
+    prog_bufs = _get_bytes_list(f, 22)
+    if prog_bufs:
+        pf = _decode_message(prog_bufs[0])
+        progress = {
+            "finished": _get_int(pf, 1),
+            "total": _get_int(pf, 2),
+        }
+
     return {
         "id": word.get("id", ""),
         "voc_id": word.get("voc_id", 0),
@@ -243,6 +258,7 @@ def parse_get_word_response(buf: bytes) -> Dict[str, Any]:
         "interpretation": "\n".join(interpretations),
         "interpretations": interpretations,
         "study_time_ms": _get_int(f, 23),
+        "progress": progress,
     }
 
 
@@ -304,6 +320,10 @@ class MaimemoWSClient:
         self._last_word_received_at: Optional[float] = None
         # SUBMIT_RESPONSE 内嵌的下一个单词，供调用方读取
         self.last_next_word: Optional[Dict[str, Any]] = None
+        # 最近一次失败原因（成功时清空），供 UI 在下一帧持久化显示
+        self.last_error: str = ""
+        # 服务端权威进度 {"finished": N, "total": M}，每次取词/提交后刷新
+        self.progress: Dict[str, int] = {}
 
     def _next_id(self) -> str:
         self._msg_seq += 1
@@ -443,6 +463,8 @@ class MaimemoWSClient:
         result = parse_get_word_response(env.get("data", b""))
         if result.get("id"):
             self._last_word_received_at = time.monotonic()
+        if result.get("progress"):
+            self.progress = result["progress"]
         return result
 
     async def submit_response(
@@ -456,20 +478,39 @@ class MaimemoWSClient:
         """
         ``WEBSTUDY_SUBMIT_RESPONSE`` —— 提交单词反馈。
 
-        **反作弊封顶**：服务端校验 ``study_duration``/``recall_duration``
-        不得超过自上次 ``get_word`` 到现在的实际经过时间。本方法会自动用
-        ``time.monotonic()`` 记录的基准把上限封到 ``elapsed_ms - 100ms``，
-        避免被网关以 ``webstudy_invalid_param`` 拒绝。
+        **反作弊语义**（实抓 web 端 VAGUE 请求确认）：
+          * ``recall_duration`` = 第一屏（看单词、回忆）耗时
+          * ``study_duration``  = 第二屏（看答案、判答）耗时
+          * 两段独立计时，``recall_duration + study_duration`` 不应超过自
+            ``GET_WORD`` 到 ``SUBMIT`` 的实际墙钟时间
 
-        响应里内嵌的"下一个单词"会被存到 :attr:`last_next_word`。
+        因此本方法 **不再各自封顶**——调用方应当用 ``time.monotonic()`` 实测
+        两段时间并传入。这里只做两个兜底：
+
+          1. 任一字段 < ``MIN_DURATION_MS`` → 上调到该值（避免 0 被服务端判非法）；
+          2. ``recall + study`` 仍然超 ``elapsed - 100ms`` → 等比例缩到合法范围。
+
+        响应里内嵌的"下一个单词"会被存到 :attr:`last_next_word`；失败原因
+        会被存到 :attr:`last_error`。
         """
+        MIN_DURATION_MS = 300
+
+        recall_duration = max(recall_duration, MIN_DURATION_MS)
+        study_duration = max(study_duration, MIN_DURATION_MS)
+
         if self._last_word_received_at is not None:
             elapsed_ms = int((time.monotonic() - self._last_word_received_at) * 1000)
-            cap_ms = max(0, elapsed_ms - 100)
-            if study_duration > cap_ms:
-                study_duration = cap_ms
-            if recall_duration > cap_ms:
-                recall_duration = cap_ms
+            budget_ms = max(0, elapsed_ms - 100)
+            total = recall_duration + study_duration
+            if total > budget_ms and total > 0:
+                # 等比例缩放，保住两段相对比例
+                ratio = budget_ms / total
+                recall_duration = max(MIN_DURATION_MS, int(recall_duration * ratio))
+                study_duration = max(MIN_DURATION_MS, int(study_duration * ratio))
+                # 缩完仍可能超（两个都被 MIN 顶住时），再 sleep 把预算挣回来
+                if recall_duration + study_duration > budget_ms:
+                    need_ms = (recall_duration + study_duration) - budget_ms
+                    await asyncio.sleep(need_ms / 1000)
 
         data = encode_submit_request(
             voc_id=word_id,
@@ -480,11 +521,13 @@ class MaimemoWSClient:
         )
         env = await self._request(EV_WEBSTUDY_SUBMIT_RESPONSE, data, timeout=10)
         if env is None:
+            self.last_error = "SUBMIT_RESPONSE 超时未收到响应"
             return False
         if not env.get("success", True):
-            print(f"[错误] SUBMIT_RESPONSE 被服务端拒绝: {env.get('errors')}")
+            self.last_error = f"服务端拒绝 SUBMIT_RESPONSE: {env.get('errors')}"
             self.last_next_word = None
             return False
+        self.last_error = ""
 
         # SubmitResponse 内嵌 next = WsWebStudyGetWordResponse (field 1)
         body = _decode_message(env.get("data", b""))
@@ -492,4 +535,7 @@ class MaimemoWSClient:
         self.last_next_word = parse_get_word_response(next_bufs[0]) if next_bufs else None
         if self.last_next_word and self.last_next_word.get("id"):
             self._last_word_received_at = time.monotonic()
+        # 服务端权威进度同步刷新（VAGUE/FORGET 不进度，FAMILIAR 才会）
+        if self.last_next_word and self.last_next_word.get("progress"):
+            self.progress = self.last_next_word["progress"]
         return True
