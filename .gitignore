@@ -40,3 +40,9 @@ ENV/
 common.*.js
 vendors.*.js
 document.yaml
+
+# Claude Code guidance
+CLAUDE.md
+
+# Local learning records
+data/

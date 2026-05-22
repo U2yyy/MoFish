@@ -16,8 +16,9 @@ import json
 import time
 import random
 import asyncio
+import argparse
 import requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 
 from rich.console import Console
@@ -41,6 +42,21 @@ except ImportError:
 
 CONFIG_FILE = "config.json"
 API_BASE_URL = "https://open.maimemo.com/open"
+
+
+# ============================================================================
+# JSONL Session Record
+# ============================================================================
+
+def append_session_record(record: dict, data_dir: str) -> None:
+    """Append a session record to sessions.jsonl. Silently ignores write failures."""
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+        path = os.path.join(data_dir, "sessions.jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 # ============================================================================
@@ -235,7 +251,7 @@ def trigger_boss(console: Console) -> None:
 # 配置加载
 # ============================================================================
 
-def load_config() -> Dict[str, str]:
+def load_config() -> Dict[str, Any]:
     if not os.path.exists(CONFIG_FILE):
         return {}
     try:
@@ -250,7 +266,9 @@ def load_config() -> Dict[str, str]:
 # ============================================================================
 
 async def learning_loop(client: MaimemoWSClient, console: Console,
-                        finished: int, total: int) -> Dict[str, Any]:
+                        finished: int, total: int, data_dir: str,
+                        record_enabled: bool = False,
+                        hide_judge_hint: bool = False) -> Dict[str, Any]:
     """
     两屏式背词循环。
       Phase 1 (recall): 伪装日志显示拼写, 等用户按任意键(b=boss, q=退出)显示释义
@@ -323,10 +341,11 @@ async def learning_loop(client: MaimemoWSClient, console: Console,
             console.print()
             render_answer_panel(console, word)
             console.print()
-            console.print(Text(
-                "  [1] 认识   [2] 模糊   [3] 忘记   [b] boss   [q] save & quit",
-                style="dim",
-            ))
+            if not hide_judge_hint:
+                console.print(Text(
+                    "  [1] 认识   [2] 模糊   [3] 忘记   [b] boss   [q] save & quit",
+                    style="dim",
+                ))
 
             # 实测 study_duration（看答案到按 1/2/3 这段）
             judge_start = time.monotonic()
@@ -344,7 +363,8 @@ async def learning_loop(client: MaimemoWSClient, console: Console,
                     console.print()
                     render_answer_panel(console, word)
                     console.print()
-                    console.print(Text("  [1] 认识   [2] 模糊   [3] 忘记   [b] boss   [q] save & quit", style="dim"))
+                    if not hide_judge_hint:
+                        console.print(Text("  [1] 认识   [2] 模糊   [3] 忘记   [b] boss   [q] save & quit", style="dim"))
                     judge_start = time.monotonic()  # 重计时
                     continue
                 if kl in ("1", "2", "3"):
@@ -364,6 +384,20 @@ async def learning_loop(client: MaimemoWSClient, console: Console,
 
             if ok:
                 learned.append({"spelling": word["spelling"], "id": word["id"], "status": status})
+                if record_enabled:
+                    append_session_record({
+                        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+                        "spelling": word["spelling"],
+                        "voc_id": word.get("voc_id") or "",
+                        "response": status,
+                        "recall_ms": recall_duration_ms,
+                        "study_ms": study_duration_ms,
+                        "interpretation": word.get("interpretation") or "",
+                        "phonetic_us": word.get("phonetic_us") or "",
+                        "phonetic_uk": word.get("phonetic_uk") or "",
+                        "difficulty": word.get("difficulty") or 0,
+                        "progress_after": dict(client.progress),
+                    }, data_dir)
                 if status == "FAMILIAR":
                     stats["known"] += 1
                 elif status == "VAGUE":
@@ -409,10 +443,21 @@ async def learning_loop(client: MaimemoWSClient, console: Console,
 # ============================================================================
 
 def main():
+    parser = argparse.ArgumentParser(prog="MoFish", add_help=False)
+    parser.add_argument("--stats", action="store_true")
+    parser.add_argument("--days", type=int, default=None)
+    args, _ = parser.parse_known_args()
+
+    config = load_config()
+    data_dir = config.get("data_dir", "data")
+
+    if args.stats:
+        print_stats(data_dir, args.days)
+        return
+
     console = Console()
     console.clear()
 
-    config = load_config()
     ws_token = config.get("ws_token", "")
     rest_token = config.get("rest_token", "")
 
@@ -467,7 +512,9 @@ def main():
     time.sleep(0.4)
 
     client = MaimemoWSClient(ws_token)
-    result = asyncio.run(learning_loop(client, console, finished, total))
+    result = asyncio.run(learning_loop(client, console, finished, total, data_dir,
+                                      record_enabled=config.get("record_enabled", False),
+                                      hide_judge_hint=config.get("hide_judge_hint", False)))
     stats = result["stats"]
     learned = result["learned"]
 
@@ -486,6 +533,214 @@ def main():
     console.print(table)
     console.print()
     console.print(Text("进度已同步到云端", style="dim italic"))
+
+
+# ============================================================================
+# Stats CLI
+# ============================================================================
+
+def parse_iso_ts(ts_str: str):
+    """Parse ISO timestamp, return None on failure."""
+    try:
+        # Handle formats like "2026-05-22T10:23:45+08:00" or "2026-05-22T10:23:45"
+        ts_str = ts_str.strip()
+        if "+" in ts_str or ts_str.endswith("Z"):
+            dt = datetime.fromisoformat(ts_str)
+        else:
+            dt = datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc)
+        return dt.astimezone()
+    except Exception:
+        return None
+
+
+def load_session_records(data_dir: str):
+    """Load all valid JSONL records, skip malformed lines."""
+    path = os.path.join(data_dir, "sessions.jsonl")
+    if not os.path.exists(path):
+        return []
+    records = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return records
+
+
+def filter_by_days(records, days: Optional[int]):
+    """Filter records by days (from today). None means all records."""
+    if days is None:
+        return records
+    now = datetime.now().astimezone()
+    cutoff = now - timedelta(days=days)
+    filtered = []
+    unknown_bucket = []
+    for r in records:
+        dt = parse_iso_ts(r.get("ts", ""))
+        if dt is None:
+            unknown_bucket.append(r)
+        elif dt >= cutoff:
+            filtered.append(r)
+    # Put unknown bucket at the end, included in full count
+    return filtered, unknown_bucket
+
+
+def print_stats(data_dir: str, days: Optional[int]):
+    console = Console()
+
+    all_records = load_session_records(data_dir)
+    if not all_records:
+        console.print("[dim]还没有学习记录。先跑 'python main.py' 背几个词。[/dim]")
+        return
+
+    if days is not None:
+        filtered, _unknown = filter_by_days(all_records, days)
+        records = filtered
+    else:
+        records = all_records
+
+    # Count totals (use all records for "total N" display, filtered for stats)
+    total_count = len(all_records)
+
+    n = len(records) or 1
+
+    # --- Block 1: 总览 ---
+    familiar = sum(1 for r in records if r.get("response") == "FAMILIAR")
+    vague = sum(1 for r in records if r.get("response") == "VAGUE")
+    forget = sum(1 for r in records if r.get("response") == "FORGET")
+
+    # Unique words
+    seen = {}
+    for r in records:
+        sp = r.get("spelling", "")
+        if sp not in seen:
+            seen[sp] = []
+        seen[sp].append(r)
+
+    unique_words = len(seen)
+
+    avg_recall = 0.0
+    avg_study = 0.0
+    if records:
+        avg_recall = sum(r.get("recall_ms", 0) for r in records) / n / 1000
+        avg_study = sum(r.get("study_ms", 0) for r in records) / n / 1000
+
+    period_label = f"最近 {days} 天" if days is not None else "累计"
+    console.print()
+    console.print(Text(f"学习总览（{period_label} / 共 {total_count} 条记录）", style="bold cyan"))
+    console.print(Text("─" * 36, style="dim"))
+    console.print(f"总提交次数：     {len(records)}")
+    console.print(f"不重复单词数：   {unique_words}")
+    console.print(f"认识 (FAMILIAR): {familiar} ({familiar*100//n}%)")
+    console.print(f"模糊 (VAGUE):    {vague} ({vague*100//n}%)")
+    console.print(f"忘记 (FORGET):   {forget} ({forget*100//n}%)")
+    console.print(f"平均回忆耗时：   {avg_recall:.1f} 秒")
+    console.print(f"平均判断耗时：   {avg_study:.1f} 秒")
+    console.print()
+
+    # --- Block 2: 顽固词 Top 10 ---
+    stubborn = []
+    for sp, recs in seen.items():
+        cnt = len(recs)
+        bad = sum(1 for r in recs if r.get("response") in ("VAGUE", "FORGET"))
+        if bad >= 1 and cnt >= 2:
+            last_rec = recs[-1]
+            stubborn.append({
+                "spelling": sp,
+                "count": cnt,
+                "bad": bad,
+                "rate": bad / cnt,
+                "interpretation": last_rec.get("interpretation", ""),
+            })
+    stubborn.sort(key=lambda x: (-x["rate"], -x["count"]))
+    stubborn = stubborn[:10]
+
+    if stubborn:
+        console.print(Text("顽固词 Top 10（被标记 VAGUE/FORGET ≥ 2 次）", style="bold cyan"))
+        t = Table(show_header=True, header_style="bold cyan")
+        t.add_column("单词", style="white")
+        t.add_column("出现次数", justify="right", style="cyan")
+        t.add_column("顽固率", justify="right", style="yellow")
+        t.add_column("最近释义", style="dim")
+        for item in stubborn:
+            rate_str = f"{item['bad']}/{item['count']} = {int(item['rate']*100)}%"
+            t.add_row(
+                item["spelling"],
+                str(item["count"]),
+                rate_str,
+                item["interpretation"][:30],
+            )
+        console.print(t)
+        console.print()
+
+    # --- Block 3: 秒杀词 Top 10 ---
+    speedsters = []
+    for sp, recs in seen.items():
+        if all(r.get("response") == "FAMILIAR" for r in recs):
+            avg_ms = sum(r.get("recall_ms", 0) for r in recs) / len(recs)
+            if avg_ms < 1500:
+                last_rec = recs[-1]
+                speedsters.append({
+                    "spelling": sp,
+                    "avg_ms": avg_ms,
+                    "count": len(recs),
+                    "interpretation": last_rec.get("interpretation", ""),
+                })
+    speedsters.sort(key=lambda x: x["avg_ms"])
+    speedsters = speedsters[:10]
+
+    if speedsters:
+        console.print(Text("秒杀词 Top 10（全FAMILIAR 且平均 recall < 1.5s）", style="bold cyan"))
+        t2 = Table(show_header=True, header_style="bold cyan")
+        t2.add_column("单词", style="white")
+        t2.add_column("平均回忆耗时(ms)", justify="right", style="cyan")
+        t2.add_column("出现次数", justify="right", style="dim")
+        t2.add_column("最近释义", style="dim")
+        for item in speedsters:
+            t2.add_row(
+                item["spelling"],
+                str(int(item["avg_ms"])),
+                str(item["count"]),
+                item["interpretation"][:30],
+            )
+        console.print(t2)
+        console.print()
+
+    # --- Block 4: 每日学习曲线 (last 14 days) ---
+    now = datetime.now().astimezone()
+    date_counts: Dict[str, int] = {}
+    for i in range(14):
+        dt = now - timedelta(days=i)
+        date_counts[dt.strftime("%m-%d")] = 0
+
+    for r in records:
+        dt = parse_iso_ts(r.get("ts", ""))
+        if dt:
+            key = dt.strftime("%m-%d")
+            if key in date_counts:
+                date_counts[key] += 1
+
+    max_count = max(date_counts.values()) or 1
+    bar_width = 30
+
+    console.print(Text("每日学习曲线（最近 14 天）", style="bold cyan"))
+    for day_str in sorted(date_counts.keys()):
+        cnt = date_counts[day_str]
+        bar_len = int(cnt / max_count * bar_width) if max_count > 0 else 0
+        bar = "█" * bar_len
+        if bar_len == 0:
+            bar_str = f"{day_str} ─ {cnt}"
+        else:
+            bar_str = f"{day_str} {bar} {cnt}"
+        console.print(Text(bar_str, style="cyan"))
+    console.print()
 
 
 if __name__ == "__main__":

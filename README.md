@@ -328,6 +328,20 @@ field 22 (progress sub-message):
   限于被风控、封禁）由使用者自行承担。
 - 不要用本项目刷数据、薅会员、或做任何超出"正常背单词"范畴的事。
 
+## 学习记录与统计
+
+每次成功提交都会往 `data/sessions.jsonl` 追一行结构化记录（单词、判答、两段
+耗时、释义、当时的服务端进度）。这份数据完全本地、不入 Git。
+
+查看统计：
+
+```bash
+python main.py --stats           # 全量
+python main.py --stats --days 7  # 最近 7 天
+```
+
+报告里有总览、顽固词 Top 10、秒杀词 Top 10、最近 14 天学习曲线。
+
 ## License
 
 [MIT](./LICENSE)
