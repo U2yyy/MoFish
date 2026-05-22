@@ -329,6 +329,11 @@ class MaimemoWSClient:
         self._msg_seq += 1
         return f"req-{self._msg_seq}"
 
+    @property
+    def is_alive(self) -> bool:
+        """连接是否还活着；recv loop 检测到 ConnectionClosed 后会变 False。"""
+        return self._connected and self.ws is not None
+
     async def connect(self) -> bool:
         """建联并等到 SYSTEM_READY。"""
         if self._connected and self.ws is not None:
@@ -389,7 +394,14 @@ class MaimemoWSClient:
             while self._connected and self.ws is not None:
                 try:
                     frame = await self.ws.recv()
-                except websockets.exceptions.ConnectionClosed:
+                except websockets.exceptions.ConnectionClosed as e:
+                    # 服务端长时间无业务请求会主动断（典型场景：召回屏空闲太久）
+                    self._connected = False
+                    reason = (e.reason or "").strip()
+                    if e.code in (1000, 1001) or "idle" in reason.lower() or not reason:
+                        self.last_error = "服务端关闭了连接（长时间无操作触发空闲超时）"
+                    else:
+                        self.last_error = f"服务端关闭了连接（code={e.code}, reason={reason!r}）"
                     break
                 if not isinstance(frame, (bytes, bytearray)):
                     continue

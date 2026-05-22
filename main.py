@@ -373,11 +373,31 @@ async def learning_loop(client: MaimemoWSClient, console: Console,
                 # 提交成功 → 下一个单词直接来自响应
                 word = client.last_next_word
             else:
-                # 提交失败：再 get 一次
+                # 服务端断了就别再尝试，友好提示用户
+                if not client.is_alive:
+                    console.print()
+                    console.print(Text(
+                        f"\n[提示] {client.last_error or '连接已断开'}",
+                        style="bold yellow",
+                    ))
+                    console.print(Text("已保存当前学习记录，下次重新运行即可继续。", style="dim"))
+                    time.sleep(1.5)
+                    break
+                # 提交失败但连接还在：再 get 一次
                 word = await client.get_word()
 
         else:
-            console.print(Text("\n[提示] 学习完成，没有更多单词", style="bright_green"))
+            # while 自然结束（word 变 None）：分清是真的学完还是断线
+            if not client.is_alive:
+                console.print()
+                console.print(Text(
+                    f"\n[提示] {client.last_error or '连接已断开'}",
+                    style="bold yellow",
+                ))
+                console.print(Text("已保存当前学习记录，下次重新运行即可继续。", style="dim"))
+                time.sleep(1.5)
+            else:
+                console.print(Text("\n[提示] 学习完成，没有更多单词", style="bright_green"))
     finally:
         await client.close()
 
