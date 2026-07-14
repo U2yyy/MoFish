@@ -367,6 +367,7 @@ class MaimemoWSClient:
             print("[错误] 等待 SYSTEM_READY 超时")
             await self.close()
             return False
+        self.last_error = ""
         return True
 
     async def close(self):
@@ -459,8 +460,11 @@ class MaimemoWSClient:
         except asyncio.CancelledError:
             pass
         except Exception as e:
+            self._connected = False
+            self.last_error = f"WebSocket 接收循环异常: {e}"
             print(f"[警告] recv loop 异常: {e}")
         finally:
+            self._connected = False
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(ConnectionError("连接已断开"))
@@ -492,7 +496,7 @@ class MaimemoWSClient:
     async def initialize(self) -> bool:
         """``WEBSTUDY_INIT_STUDY`` —— 学习会话握手。"""
         env = await self._request(EV_WEBSTUDY_INIT_STUDY, b"", timeout=15)
-        return env is not None
+        return env is not None and env.get("success", False)
 
     async def add_words(self, count: int, mode: int = 2) -> Optional[int]:
         """

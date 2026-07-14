@@ -80,6 +80,12 @@ def read_key() -> str:
     return input().strip()[:1] or "\n"
 
 
+async def async_read_key() -> str:
+    """在线程池中等待按键，避免阻塞 WebSocket 的 asyncio 接收循环。"""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, read_key)
+
+
 # ============================================================================
 # REST: 取学习进度
 # ============================================================================
@@ -261,6 +267,43 @@ def load_config() -> Dict[str, Any]:
         return {}
 
 
+async def restore_learning_session(
+    client: MaimemoWSClient,
+    console: Console,
+    current_word: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """断线后重建学习会话，并重新取得服务端当前待学习单词。"""
+    expected_word_id = current_word.get("id", "")
+    console.print()
+    console.print(Text(f"[{_now()}] [WARN] Connection lost; reconnecting...", style="bold yellow"))
+
+    await client.close()
+    if not await client.connect():
+        client.last_error = "自动重连失败"
+        console.print(Text("[错误] 自动重连失败，请稍后重新运行", style="bold red"))
+        return None
+    if not await client.initialize():
+        client.last_error = "自动重连后初始化学习会话失败"
+        console.print(Text("[错误] 自动重连后初始化学习会话失败", style="bold red"))
+        return None
+
+    restored_word = await client.get_word()
+    if not restored_word or not restored_word.get("id"):
+        client.last_error = "自动重连后未能恢复当前单词"
+        console.print(Text("[错误] 自动重连后未能恢复当前单词", style="bold red"))
+        return None
+
+    client.last_error = ""
+    if expected_word_id and restored_word["id"] != expected_word_id:
+        console.print(Text(
+            f"[{_now()}] [INFO] Server advanced the queue; restarting with the current word",
+            style="cyan",
+        ))
+    else:
+        console.print(Text(f"[{_now()}] [INFO] Learning session restored", style="bright_green"))
+    return restored_word
+
+
 # ============================================================================
 # 学习循环
 # ============================================================================
@@ -298,11 +341,17 @@ async def learning_loop(client: MaimemoWSClient, console: Console,
             else:
                 console.print(Text(f"[{_now()}] [INFO] Added {added} words to today's queue", style="cyan"))
                 total += added
-            time.sleep(0.3)
+            await asyncio.sleep(0.3)
 
         word = await client.get_word()
 
         while word and word.get("id"):
+            if not client.is_alive:
+                restored_word = await restore_learning_session(client, console, word)
+                if restored_word is None:
+                    break
+                word = restored_word
+
             # 服务端权威进度（WS 自带，VAGUE/FORGET 不会推进 finished）
             srv_finished = client.progress.get("finished", finished)
             srv_total = client.progress.get("total", total) or 1
@@ -341,15 +390,26 @@ async def learning_loop(client: MaimemoWSClient, console: Console,
             # ---------- 第一屏交互：等用户回忆 ----------
             # 实测 recall_duration（看单词到揭开答案这段）
             recall_start = time.monotonic()
-            recall_key = read_key()
+            recall_key = await async_read_key()
             if recall_key.lower() == "q":
                 break
             if recall_key.lower() == "b":
                 trigger_boss(console)
-                read_key()
+                await async_read_key()
                 # boss 之后回到当前单词，重画
                 continue
             recall_duration_ms = int((time.monotonic() - recall_start) * 1000)
+
+            # 等待按键期间若发生真实网络断线，先恢复服务端当前词。
+            if not client.is_alive:
+                previous_word_id = word["id"]
+                restored_word = await restore_learning_session(client, console, word)
+                if restored_word is None:
+                    break
+                word = restored_word
+                if word["id"] != previous_word_id:
+                    # 服务端当前词已经变化，不能把旧词的计时/判答套到新词上。
+                    continue
 
             # ---------- 第二屏：显示释义 + 等判答 ----------
             console.print()
@@ -363,14 +423,15 @@ async def learning_loop(client: MaimemoWSClient, console: Console,
 
             # 实测 study_duration（看答案到按 1/2/3 这段）
             judge_start = time.monotonic()
+            restart_with_restored_word = False
             while True:
-                k = read_key()
+                k = await async_read_key()
                 kl = k.lower()
                 if kl == "q":
                     return {"stats": stats, "learned": learned}
                 if kl == "b":
                     trigger_boss(console)
-                    read_key()
+                    await async_read_key()
                     # boss 之后重画当前答案屏
                     console.clear()
                     console.print(Text(f"[{bar}] {current_global}/{srv_total}", style="cyan"))
@@ -383,7 +444,17 @@ async def learning_loop(client: MaimemoWSClient, console: Console,
                     continue
                 if kl in ("1", "2", "3"):
                     status = {"1": "FAMILIAR", "2": "VAGUE", "3": "FORGET"}[kl]
+                    if not client.is_alive:
+                        previous_word_id = word["id"]
+                        restored_word = await restore_learning_session(client, console, word)
+                        if restored_word is None:
+                            return {"stats": stats, "learned": learned}
+                        word = restored_word
+                        if word["id"] != previous_word_id:
+                            restart_with_restored_word = True
                     break
+            if restart_with_restored_word:
+                continue
             study_duration_ms = int((time.monotonic() - judge_start) * 1000)
 
             # ---------- 提交反馈 ----------
@@ -429,7 +500,7 @@ async def learning_loop(client: MaimemoWSClient, console: Console,
                         style="bold yellow",
                     ))
                     console.print(Text("已保存当前学习记录，下次重新运行即可继续。", style="dim"))
-                    time.sleep(1.5)
+                    await asyncio.sleep(1.5)
                     break
                 # 提交失败但连接还在：再 get 一次
                 word = await client.get_word()
@@ -443,7 +514,7 @@ async def learning_loop(client: MaimemoWSClient, console: Console,
                     style="bold yellow",
                 ))
                 console.print(Text("已保存当前学习记录，下次重新运行即可继续。", style="dim"))
-                time.sleep(1.5)
+                await asyncio.sleep(1.5)
             else:
                 console.print(Text("\n[提示] 学习完成，没有更多单词", style="bright_green"))
     finally:
